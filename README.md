@@ -69,3 +69,7 @@ XCI conversion reads the cartridge image's `secure` HFS0 partition and writes it
 ## Legal
 
 JadyxDrop is an unofficial tool. It is not affiliated with Jadyx, Microsoft or Nintendo. It does not contain or download keys, firmware or games. Only use games you have dumped yourself from hardware and cartridges or eShop purchases you own.
+
+## License
+
+[MIT](LICENSE) © 2026 xorica27
