@@ -180,6 +180,13 @@ func fingerprint(_ url: URL, name: String, size: Int64) throws -> String {
 
 // MARK: - Model
 
+final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+}
+
 struct Item: Identifiable {
     let id = UUID()
     let url: URL
@@ -207,7 +214,9 @@ final class Model: ObservableObject {
     @Published var items: [Item] = []
     @Published var running = false
     @Published var pendingOnConsole: String? = nil
-    private var stopped = false
+    /// Read by the XCI converter on a background thread, so it lives in a lock-protected flag.
+    private let stopFlag = StopFlag()
+    private var stopped = false { didSet { stopFlag.set(stopped) } }
     private var portal = Portal(base: "")
     private var keepAlive: Task<Void, Never>?
     private let chunk = 16 * 1_048_576
@@ -278,7 +287,7 @@ final class Model: ObservableObject {
             if items.contains(where: { $0.url == u && !$0.done && !$0.failed }) { continue }
             let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             var it = Item(url: u, size: size)
-            if !connected { it.state = it.isXCI ? "XCI · will convert to NSP · waiting for a portal code" : "Waiting for a portal code" }
+            if !connected { it.state = it.isXCI ? "Queued · will convert to NSP" : "Waiting for a portal code" }
             items.append(it)
         }
         let rejected = urls.filter { !Model.accepted.contains($0.pathExtension.lowercased()) }
@@ -302,7 +311,10 @@ final class Model: ObservableObject {
 
     func clearFinished() { items.removeAll { $0.done || $0.failed } }
 
-    private func eligible(_ it: Item) -> Bool { !it.done && !it.failed && !it.paused && connected }
+    /// Uploads need a portal session; XCI conversion can run before pairing so it's ready when the code arrives.
+    private func eligible(_ it: Item) -> Bool {
+        !it.done && !it.failed && !it.paused && (connected || (it.isXCI && it.nspURL == nil))
+    }
     var hasWaiting: Bool { items.contains { !$0.done && !$0.failed } }
 
     func resume() {
@@ -318,6 +330,7 @@ final class Model: ObservableObject {
             while !stopped, let i = items.firstIndex(where: eligible) {
                 do {
                     if items[i].isXCI && items[i].nspURL == nil { try await convert(i) }
+                    if !connected { items[i].state = "Converted to NSP · waiting for a portal code"; continue }
                     try await send(i)
                     items[i].state = items[i].isXCI
                         ? (items[i].tempNSP ? "Converted and installed in library" : "Installed in library · NSP saved next to the XCI")
@@ -336,7 +349,7 @@ final class Model: ObservableObject {
                 }
             }
             for i in items.indices where !items[i].done && !items[i].failed && !items[i].paused && !connected {
-                items[i].state = "Waiting for a portal code"
+                items[i].state = items[i].nspURL != nil ? "Converted to NSP · waiting for a portal code" : "Waiting for a portal code"
             }
             if !items.isEmpty && items.allSatisfy({ $0.done }) { message = "All uploads finished." }
             if connected { try? await refreshPending() }
@@ -359,9 +372,9 @@ final class Model: ObservableObject {
             dst = cache.appendingPathComponent(nspName); temp = true
         }
         items[i].state = "Converting XCI → NSP"
-        let id = items[i].id
+        let id = items[i].id, flag = stopFlag
         try await Task.detached(priority: .userInitiated) { [weak self] in
-            try convertXCI(src, to: dst, cancelled: { self?.isStopped ?? true }) { frac in
+            try convertXCI(src, to: dst, cancelled: { flag.isSet }) { frac in
                 Task { @MainActor in
                     guard let self, let k = self.items.firstIndex(where: { $0.id == id }) else { return }
                     self.items[k].progress = frac
@@ -371,8 +384,6 @@ final class Model: ObservableObject {
         }.value
         items[i].nspURL = dst; items[i].tempNSP = temp; items[i].progress = 0; items[i].speed = ""
     }
-
-    nonisolated var isStopped: Bool { MainActor.assumeIsolated { stopped } }
 
     func stop() {
         stopped = true
